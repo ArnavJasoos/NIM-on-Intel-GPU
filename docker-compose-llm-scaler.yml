@@ -1,0 +1,141 @@
+version: '3.8'
+
+# NIM + LLM-Scaler Architecture
+# Uses Intel's official LLM-Scaler (vLLM-based) instead of IPEX-LLM
+# Fully compatible with existing NIM proxy layer
+# Change log: Only the backend image and entrypoint differ from IPEX version
+
+services:
+  llm-scaler-backend:
+    # intel/llm-scaler-vllm is Intel's official, actively maintained inference engine
+    # Replaces IPEX-LLM with newer vLLM (0.14.0+) and optimizations
+    image: intel/llm-scaler-vllm:1.3
+    container_name: nim-llm-scaler-backend
+    restart: unless-stopped
+    
+    devices:
+      - /dev/dri:/dev/dri
+    
+    group_add:
+      - render
+    
+    ports:
+      - "${IPEX_BACKEND_PORT:-8001}:8000"
+    
+    environment:
+      # Intel XPU (GPU) runtime configuration
+      SYCL_CACHE_PERSISTENT: "1"
+      SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS: "1"
+      SYCL_DEVICE_FILTER: "level_zero"
+      
+      # Model caching
+      HF_HOME: /root/.cache/huggingface
+      
+      # LLM-Scaler specific (optional optimizations)
+      # VLLM_USE_V1: "0"  # Use vLLM v0 engine (more stable for iGPU)
+    
+    volumes:
+      # Shared HuggingFace model cache across containers
+      - ${HF_CACHE_PATH:-~/.cache/huggingface}:/root/.cache/huggingface
+      
+      # Optional: local model directory for offline/airgapped deployments
+      - ./models:/models
+    
+    # LLM-Scaler command format (same as modern vLLM)
+    command: >
+      python3 -m vllm.entrypoints.openai.api_server
+        --model ${LLM_MODEL_NAME}
+        --served-model-name ${LLM_MODEL_NAME}
+        --device xpu
+        --dtype float16
+        --load-in-low-bit sym_int4
+        --gpu-memory-utilization 0.85
+        --max-model-len 4096
+        --max-num-batched-tokens 10240
+        --port 8000
+        --trust-remote-code
+        --enforce-eager
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/models"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 360s
+    
+    networks:
+      - nim-llm-scaler-net
+    
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 14G
+        reservations:
+          cpus: '2'
+          memory: 12G
+  
+  nim-proxy:
+    # NVIDIA NIM container (unchanged from IPEX-LLM architecture)
+    # Fully compatible with LLM-Scaler backend on port 8001
+    image: ${NIM_CONTAINER_URL}
+    container_name: nim-proxy
+    restart: unless-stopped
+    
+    ports:
+      - "${NIM_PROXY_PORT:-8000}:8000"
+    
+    environment:
+      # NIM authentication
+      NGC_API_KEY: ${NGC_API_KEY}
+      
+      # GPU probe bypass (patches for Intel GPU compatibility)
+      NIM_BACKEND_URL: "http://llm-scaler-backend:8000"
+      NIM_SKIP_GPU_PROBE: "1"
+      CUDA_VISIBLE_DEVICES: ""
+      NIM_SERVER_PORT: "8000"
+    
+    volumes:
+      # Adapter script patches NIM's CUDA detection
+      - ./config/nim-adapter.py:/opt/nim-adapter.py
+      
+      # NIM cache for downloaded models/engines
+      - ${NIM_CACHE_PATH:-~/.cache/nim}:/opt/nim/.cache
+    
+    entrypoint: ["python", "/opt/nim-adapter.py"]
+    
+    depends_on:
+      llm-scaler-backend:
+        condition: service_healthy
+    
+    networks:
+      - nim-llm-scaler-net
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/models"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          cpus: '1'
+          memory: 2G
+
+networks:
+  nim-llm-scaler-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+volumes:
+  huggingface-cache:
+    driver: local
+  nim-cache:
+    driver: local

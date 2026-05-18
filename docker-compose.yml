@@ -1,0 +1,131 @@
+version: '3.8'
+
+services:
+
+  # ── IPEX-LLM Backend ─────────────────────────────────────────────────────
+  # Inference engine on Intel iGPU via SYCL/Level Zero.
+  # Exposes OpenAI-compatible API internally on port 8000.
+  ipex-backend:
+    image: ${IPEX_IMAGE:-intelanalytics/ipex-llm-serving-xpu:latest}
+    container_name: nim-ipex-backend
+    restart: unless-stopped
+
+    devices:
+      - /dev/dri:/dev/dri       # Intel GPU passthrough
+
+    group_add:
+      - render                   # Required for GPU access without root
+
+    ports:
+      - "${IPEX_BACKEND_PORT:-8001}:8000"
+
+    environment:
+      SYCL_CACHE_PERSISTENT: "1"
+      SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS: "1"
+      SYCL_DEVICE_FILTER: "level_zero"
+      HF_HOME: /root/.cache/huggingface
+
+    volumes:
+      - ${HF_CACHE_PATH:-~/.cache/huggingface}:/root/.cache/huggingface
+      - ./models:/models
+
+    command: >
+      python -m ipex_llm.vllm.xpu.entrypoints.openai.api_server
+        --model ${LLM_MODEL_NAME}
+        --served-model-name ${LLM_MODEL_NAME}
+        --device xpu
+        --dtype float16
+        --load-in-low-bit sym_int4
+        --gpu-memory-utilization 0.85
+        --max-model-len 4096
+        --max-num-batched-tokens 10240
+        --port 8000
+        --trust-remote-code
+        --enforce-eager
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/models"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      # FIX 1: Increased 120s -> 360s. SYCL kernel compilation takes up to
+      # 5 min on first run. At 120s Docker marked the container unhealthy and
+      # killed it before it was ready, blocking nim-proxy from starting.
+      start_period: 360s
+
+    networks:
+      - nim-ipex-net
+
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 14G
+        reservations:
+          cpus: '2'
+          memory: 12G
+
+  # ── NIM Proxy ─────────────────────────────────────────────────────────────
+  # NVIDIA NIM with GPU probe bypassed via nim-adapter.py.
+  nim-proxy:
+    image: ${NIM_CONTAINER_URL}
+    container_name: nim-proxy
+    restart: unless-stopped
+
+    ports:
+      - "${NIM_PROXY_PORT:-8000}:8000"
+
+    environment:
+      NGC_API_KEY: ${NGC_API_KEY}
+      NIM_BACKEND_URL: "http://ipex-backend:8000"
+      NIM_SKIP_GPU_PROBE: "1"
+      CUDA_VISIBLE_DEVICES: ""
+      NIM_SERVER_PORT: "8000"
+
+    volumes:
+      - ./config/nim-adapter.py:/opt/nim-adapter.py
+      - ${NIM_CACHE_PATH:-~/.cache/nim}:/opt/nim/.cache
+
+    # FIX 2: Entrypoint runs nim-adapter.py directly as Python.
+    # The adapter calls os.execvp internally to replace itself with the NIM
+    # process — so all patched os.environ vars are inherited in-process.
+    # Removed the old "bash -c ... || true" wrapper which:
+    #   (a) silently swallowed adapter failures, and
+    #   (b) launched NIM in a new shell that did NOT inherit os.environ patches.
+    entrypoint: ["python", "/opt/nim-adapter.py"]
+
+    depends_on:
+      ipex-backend:
+        condition: service_healthy
+
+    networks:
+      - nim-ipex-net
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/models"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          cpus: '1'
+          memory: 2G
+
+networks:
+  nim-ipex-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+volumes:
+  huggingface-cache:
+    driver: local
+  nim-cache:
+    driver: local
