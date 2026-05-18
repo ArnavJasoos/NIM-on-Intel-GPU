@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
 
   # ── IPEX-LLM Backend ─────────────────────────────────────────────────────
@@ -13,8 +11,10 @@ services:
     devices:
       - /dev/dri:/dev/dri       # Intel GPU passthrough
 
+    privileged: true
+
     group_add:
-      - render                   # Required for GPU access without root
+      - "${RENDER_GID:-110}"                   # Required for GPU access without root
 
     ports:
       - "${IPEX_BACKEND_PORT:-8001}:8000"

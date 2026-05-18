@@ -52,7 +52,7 @@ fi
 
 # Helper function to call docker-compose with the right file
 call_compose() {
-    docker-compose -f "$COMPOSE_FILE" "$@"
+    docker compose -f "$COMPOSE_FILE" "$@"
 }
 
 load_config() {
